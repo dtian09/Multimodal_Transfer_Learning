@@ -1,7 +1,8 @@
 #training and testing the multimodal transformer model
 #download the Flickr30k dataset from Hugging Face
 #split the dataset into training and testing sets
-#training epochs:
+#create training batches and testing batches 
+#for each training epoch:
 # split each image of the training set into patches
 # project each patch into a vector
 # pass the patches to the encoder
