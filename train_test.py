@@ -5,8 +5,10 @@
 #for each training epoch:
 # split each image of the training set into patches
 # project each patch into a vector
-# pass the patches to the encoder
-# pass the text descriptions to decoder
+# create embeddings of the vector
+# pass the embeddings to the encoder
+# insert <sos> to the image caption and pass the embeddings of the image captions to the decoder
+# pass the output of the encoder and target image caption to the decoder
 
 
 
