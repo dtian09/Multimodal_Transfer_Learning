@@ -1,5 +1,5 @@
 #training and testing the multimodal transformer model
-from preprocess import load_dataloaders
+from preprocessCLIP import load_dataloaders
 import transformers
 import torch
 import torch.nn as nn
@@ -7,6 +7,33 @@ from tqdm import tqdm
 import wandb
 from sklearn.metrics import accuracy_score
 import numpy as np
+
+# Initialize wandb
+wandb.init(
+        project="multimodal-transfer-learning", 
+        entity="dtian",
+        config={
+            "batch_size": 64,
+            "hidden_size": 512,
+            "num_heads": 8,
+            "vocab_size": 32000,
+            "num_decoder_layers": 6,
+            "dropout": 0.1,
+            "epochs": 10,
+            "learning_rate": 0.0001,
+            "patience": 5
+        })
+
+# Get parameters from wandb config
+batch_size = wandb.config.batch_size
+hidden_size = wandb.config.hidden_size
+num_heads = wandb.config.num_heads
+vocab_size = wandb.config.vocab_size
+num_decoder_layers = wandb.config.num_decoder_layers
+dropout = wandb.config.dropout
+num_epochs = wandb.config.epochs
+learning_rate = wandb.config.learning_rate
+patience = wandb.config.patience
 
 # Load dataloaders and model
 train_loader, test_loader = load_dataloaders()
@@ -17,9 +44,10 @@ train_size = int(0.8 * len(train_loader.dataset))
 val_size = len(train_loader.dataset) - train_size
 train_dataset, val_dataset = torch.utils.data.random_split(train_loader.dataset, [train_size, val_size])
 
-# Create new dataloaders
-train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=train_loader.batch_size, shuffle=True)
-val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=train_loader.batch_size, shuffle=False)
+# Create new dataloaders with batch size from wandb config
+train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+test_loader = torch.utils.data.DataLoader(test_loader.dataset, batch_size=batch_size, shuffle=False)
 
 # Move model to GPU if available
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -94,6 +122,7 @@ class DecoderLayer(nn.Module):
         return x
 
 # Define the decoder with residual connections and linear projection
+
 class ImageCaptionDecoder(nn.Module):
     def __init__(self, hidden_size=512, num_heads=8, vocab_size=32000, num_decoder_layers=6, dropout=0.1):
         super().__init__()
@@ -113,163 +142,112 @@ class ImageCaptionDecoder(nn.Module):
         # Linear projection to vocabulary size
         self.projection = nn.Linear(hidden_size, vocab_size)
         
-    def forward(self, tgt, memory):
-        # tgt: caption input sequence [batch_size, seq_len, hidden_size]
-        # memory: context vectors [batch_size, 1, hidden_size]
+    def forward(self, combined_embeddings):
+        # combined_embeddings: [batch_size, num_patches+seq_len, hidden_size]
         
-        # Add positional encoding to caption embeddings
-        tgt = self.pos_encoder(tgt)
+        # Add positional encoding
+        combined_embeddings = self.pos_encoder(combined_embeddings)
         
-        # Concatenate context vector with caption embeddings
-        # memory: [batch_size, 1, hidden_size]
-        # tgt: [batch_size, seq_len, hidden_size]
-        combined = torch.cat([memory, tgt], dim=1)  # [batch_size, seq_len+1, hidden_size]
-        
-        # Pass through each decoder layer
+        # Pass through decoder layers
         for decoder_layer in self.decoder_layers:
-            combined = decoder_layer(combined)
+            combined_embeddings = decoder_layer(combined_embeddings)
         
-        # Project to vocabulary size for caption logits
-        # Only project the caption part (excluding the context vector)
-        logits = self.projection(combined[:, 1:])  # [batch_size, seq_len, vocab_size]
+        # Project only caption part (assumes first token is image context)
+        logits = self.projection(combined_embeddings[:, 1:])  # [batch_size, seq_len, vocab_size]
         
         return logits
 
-# Process image patches through CLIP's vision encoder
-def get_context_vectors_from_encoder(image_patches):
-    # Process each image in the batch
-    context_vectors = []
+def get_patch_embeddings_from_encoder(images):
+    """Process full images (not patches) using CLIP vision encoder."""
+    with torch.no_grad():
+        vision_outputs = model.vision_model(pixel_values=images, return_dict=True)
+        hidden_state = vision_outputs.last_hidden_state  # [B, num_patches+1, hidden_size]
+        return hidden_state[:, 1:]  # Exclude [CLS] token
+
+def compute_patch_embeddings(dataloader, device):
+    patch_embeddings = []    
+    for batch in tqdm(dataloader, desc="Processing images"):
+        images = batch['images'].to(device)
+        batch_patch_embeddings = get_patch_embeddings_from_encoder(images)
+        patch_embeddings.append(batch_patch_embeddings)
+    return patch_embeddings
+
+def compute_text_embeddings(dataloader, device):
+    """Pre-compute text embeddings for all captions in a dataloader.
     
-    for patches in image_patches:
-        # Process image patches through CLIP's vision encoder
-        vision_outputs = model.vision_model(
-            pixel_values=patches.unsqueeze(0),  # Add batch dimension
-            return_dict=True
-        )
+    Args:
+        dataloader: DataLoader containing the captions
+        device: Device to run the computation on
         
-        # Get the hidden state output instead of pooled output
-        # This contains spatial information from the image patches
-        # Shape: [1, num_patches + 1, hidden_size]
-        # The +1 is for the [CLS] token
-        hidden_state = vision_outputs.last_hidden_state
-        
-        # Remove the [CLS] token and use the patch embeddings as context
-        # Shape: [1, num_patches, hidden_size]
-        context_vector = hidden_state[:, 1:]
-        
-        context_vectors.append(context_vector)
-    
-    return torch.cat(context_vectors, dim=0)  # Shape: [batch_size, num_patches, hidden_size]
+    Returns:
+        Tuple of (list of text embeddings for each batch, list of labels for each batch)
+    """
+    text_embeddings = []
+    labels = []
+    for batch in tqdm(dataloader, desc="Processing captions"):
+        captions = batch['captions']
+        batch_embeddings = []
+        batch_labels = []
+        for caption_input, caption_label in captions[0]:
+            caption_input = caption_input.to(device)
+            caption_label = caption_label.to(device)
+            text_outputs = model.text_model(
+                input_ids=caption_input.unsqueeze(0),
+                return_dict=True
+            )
+            caption_embeddings = text_outputs.last_hidden_state
+            batch_embeddings.append(caption_embeddings)
+            batch_labels.append(caption_label)
+        text_embeddings.append(batch_embeddings)
+        labels.append(batch_labels)
+    return text_embeddings, labels
 
-# Initialize wandb
+def precompute_decoder_inputs(patch_embeddings_list, text_embeddings_list):
+    combined_inputs = []
+    for batch_patches, batch_captions in zip(patch_embeddings_list, text_embeddings_list):
+        batch_combined = []
+        for patch_embed, caption_embed in zip(batch_patches, batch_captions):
+            combined = torch.cat([patch_embed.unsqueeze(0), caption_embed], dim=1)  # Add batch dimension to patch_embed
+            batch_combined.append(combined)
+        combined_inputs.append(batch_combined)
+    return combined_inputs
 
-wandb.init(
-        project="multimodal-transfer-learning", 
-        entity="dtian",
-        config={
-            "batch_size": batch_size,
-            "embed_dim": embed_dim,
-            "ff_dim": ff_dim, 
-            "num_layers": num_layers,
-            "epochs": epochs,
-            "learning_rate": lr,
-            "patience": patience
-        })
-
-# Initialize decoder
-decoder = ImageCaptionDecoder().to(device)
-
-# Initialize optimizer
-optimizer = torch.optim.Adam(decoder.parameters(), lr=0.0001)
-
-num_epochs = 10
-
-# Pre-compute context vectors for all training data
+# Pre-compute context vectors for all datasets
 print("Pre-computing context vectors for training data...")
-train_context_vectors = []
-for batch in tqdm(train_loader, desc="Processing training images"):
-    image_patches = batch['image_patches'].to(device)
-    context_vectors = get_context_vectors_from_encoder(image_patches)
-    train_context_vectors.append(context_vectors)
+train_patch_embeddings = compute_patch_embeddings(train_loader, device)
 
-# Pre-compute context vectors for all validation data
 print("Pre-computing context vectors for validation data...")
-val_context_vectors = []
-for batch in tqdm(val_loader, desc="Processing validation images"):
-    image_patches = batch['image_patches'].to(device)
-    context_vectors = get_context_vectors_from_encoder(image_patches)
-    val_context_vectors.append(context_vectors)
+val_patch_embeddings = compute_patch_embeddings(val_loader, device)
 
-# Pre-compute context vectors for all test data
 print("Pre-computing context vectors for test data...")
-test_context_vectors = []
-for batch in tqdm(test_loader, desc="Processing test images"):
-    image_patches = batch['image_patches'].to(device)
-    context_vectors = get_context_vectors_from_encoder(image_patches)
-    test_context_vectors.append(context_vectors)
+test_patch_embeddings = compute_patch_embeddings(test_loader, device)
 
-# Pre-compute text embeddings for all training data
+# Pre-compute text embeddings for all datasets
 print("Pre-computing text embeddings for training data...")
-train_text_embeddings = []
-train_labels = []
-for batch in tqdm(train_loader, desc="Processing training captions"):
-    captions = batch['captions']
-    batch_embeddings = []
-    batch_labels = []
-    for caption_input, caption_label in captions[0]:
-        caption_input = caption_input.to(device)
-        caption_label = caption_label.to(device)
-        text_outputs = model.text_model(
-            input_ids=caption_input.unsqueeze(0),
-            return_dict=True
-        )
-        caption_embeddings = text_outputs.last_hidden_state
-        batch_embeddings.append(caption_embeddings)
-        batch_labels.append(caption_label)
-    train_text_embeddings.append(batch_embeddings)
-    train_labels.append(batch_labels)
+train_text_embeddings, train_labels = compute_text_embeddings(train_loader, device)
 
-# Pre-compute text embeddings for all validation data
 print("Pre-computing text embeddings for validation data...")
-val_text_embeddings = []
-val_labels = []
-for batch in tqdm(val_loader, desc="Processing validation captions"):
-    captions = batch['captions']
-    batch_embeddings = []
-    batch_labels = []
-    for caption_input, caption_label in captions[0]:
-        caption_input = caption_input.to(device)
-        caption_label = caption_label.to(device)
-        text_outputs = model.text_model(
-            input_ids=caption_input.unsqueeze(0),
-            return_dict=True
-        )
-        caption_embeddings = text_outputs.last_hidden_state
-        batch_embeddings.append(caption_embeddings)
-        batch_labels.append(caption_label)
-    val_text_embeddings.append(batch_embeddings)
-    val_labels.append(batch_labels)
+val_text_embeddings, val_labels = compute_text_embeddings(val_loader, device)
 
-# Pre-compute text embeddings for all test data
 print("Pre-computing text embeddings for test data...")
-test_text_embeddings = []
-test_labels = []
-for batch in tqdm(test_loader, desc="Processing test captions"):
-    captions = batch['captions']
-    batch_embeddings = []
-    batch_labels = []
-    for caption_input, caption_label in captions[0]:
-        caption_input = caption_input.to(device)
-        caption_label = caption_label.to(device)
-        text_outputs = model.text_model(
-            input_ids=caption_input.unsqueeze(0),
-            return_dict=True
-        )
-        caption_embeddings = text_outputs.last_hidden_state
-        batch_embeddings.append(caption_embeddings)
-        batch_labels.append(caption_label)
-    test_text_embeddings.append(batch_embeddings)
-    test_labels.append(batch_labels)
+test_text_embeddings, test_labels = compute_text_embeddings(test_loader, device)
+
+print("Creating decoder input embeddings...")
+train_combined_inputs = precompute_decoder_inputs(train_patch_embeddings, train_text_embeddings)
+val_combined_inputs = precompute_decoder_inputs(val_patch_embeddings, val_text_embeddings)
+test_combined_inputs = precompute_decoder_inputs(test_patch_embeddings, test_text_embeddings)
+
+# Initialize decoder with parameters from wandb config
+decoder = ImageCaptionDecoder(
+    hidden_size=hidden_size,
+    num_heads=num_heads,
+    vocab_size=vocab_size,
+    num_decoder_layers=num_decoder_layers,
+    dropout=dropout
+).to(device)
+
+# Initialize optimizer with learning rate from wandb config
+optimizer = torch.optim.Adam(decoder.parameters(), lr=learning_rate)
 
 # Training loop
 for epoch in range(num_epochs):
@@ -280,24 +258,23 @@ for epoch in range(num_epochs):
     # Set model to training mode
     decoder.train()
     
-    # Training loop
+    #iterate over the training loader
     for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Training")):
         # Zero the gradients
         optimizer.zero_grad()
         
         # Get pre-computed context vectors and text embeddings
-        context_vectors = train_context_vectors[batch_idx]
-        batch_embeddings = train_text_embeddings[batch_idx]
+        combined_inputs = train_combined_inputs[batch_idx]
         batch_labels = train_labels[batch_idx]
         
         # Process each image-caption pair
         batch_loss = 0
-        for i, (caption_embeddings, caption_label) in enumerate(zip(batch_embeddings, batch_labels)):
+        for i, (combined_input, caption_label) in enumerate(zip(combined_inputs, batch_labels)):
             # Get context vector for this image
-            context_vector = context_vectors[i].unsqueeze(0)
+            combined_input = combined_input.unsqueeze(0)
             
             # Pass through decoder
-            logits = decoder(caption_embeddings, context_vector)
+            logits = decoder(combined_input)
             
             # Compute cross entropy loss
             logits = logits.view(-1, logits.size(-1))
@@ -309,7 +286,7 @@ for epoch in range(num_epochs):
             batch_loss += loss.item()
         
         # Average loss over captions in batch
-        batch_loss /= len(batch_embeddings)
+        batch_loss /= len(combined_inputs)
         total_train_loss += batch_loss
         num_train_batches += 1
         
@@ -335,13 +312,12 @@ for epoch in range(num_epochs):
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Validation")):
-            context_vectors = val_context_vectors[batch_idx]
-            batch_embeddings = val_text_embeddings[batch_idx]
+            combined_inputs = val_combined_inputs[batch_idx]
             batch_labels = val_labels[batch_idx]
             
-            for i, (caption_embeddings, caption_label) in enumerate(zip(batch_embeddings, batch_labels)):
-                context_vector = context_vectors[i].unsqueeze(0)
-                logits = decoder(caption_embeddings, context_vector)
+            for i, (combined_input, caption_label) in enumerate(zip(combined_inputs, batch_labels)):
+                combined_input = combined_input.unsqueeze(0)
+                logits = decoder(combined_input)
                 predictions = torch.argmax(logits, dim=-1)
                 
                 # Remove padding tokens (0) for accuracy calculation
@@ -372,13 +348,12 @@ test_true_labels = []
 
 with torch.no_grad():
     for batch_idx, batch in enumerate(tqdm(test_loader, desc="Test")):
-        context_vectors = test_context_vectors[batch_idx]
-        batch_embeddings = test_text_embeddings[batch_idx]
+        combined_inputs = test_combined_inputs[batch_idx]
         batch_labels = test_labels[batch_idx]
         
-        for i, (caption_embeddings, caption_label) in enumerate(zip(batch_embeddings, batch_labels)):
-            context_vector = context_vectors[i].unsqueeze(0)
-            logits = decoder(caption_embeddings, context_vector)
+        for i, (combined_input, caption_label) in enumerate(zip(combined_inputs, batch_labels)):
+            combined_input = combined_input.unsqueeze(0)
+            logits = decoder(combined_input)
             predictions = torch.argmax(logits, dim=-1)
             
             # Remove padding tokens (0) for accuracy calculation
