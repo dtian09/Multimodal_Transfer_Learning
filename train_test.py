@@ -4,6 +4,9 @@ import transformers
 import torch
 import torch.nn as nn
 from tqdm import tqdm
+import wandb
+from sklearn.metrics import accuracy_score
+import numpy as np
 
 # Load dataloaders and model
 train_loader, test_loader = load_dataloaders()
@@ -34,15 +37,12 @@ class LearnablePositionalEncoding(nn.Module):
         position_embeddings = self.position_embeddings[:seq_len].unsqueeze(0)  # [1, seq_len, d_model]
         return x + position_embeddings
 
-# Define the decoder with residual connections and linear projection
-class ImageCaptionDecoder(nn.Module):
-    def __init__(self, hidden_size=512, num_heads=8, vocab_size=32000):
+# Define a single decoder layer
+class DecoderLayer(nn.Module):
+    def __init__(self, hidden_size=512, num_heads=8, dropout=0.1):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
-        
-        # Positional encoding
-        self.pos_encoder = LearnablePositionalEncoding(hidden_size)
         
         # Multi-head self-attention
         self.self_attn = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
@@ -59,16 +59,60 @@ class ImageCaptionDecoder(nn.Module):
         self.norm2 = nn.LayerNorm(hidden_size)
         
         # Dropout
-        self.dropout = nn.Dropout(0.1)
-        
-        # Linear projection to vocabulary size
-        self.projection = nn.Linear(hidden_size, vocab_size)
-        
-    def create_mask(self, sz):
+        self.dropout = nn.Dropout(dropout)
+    
+    def create_mask(self, sz, device):
         mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
         return mask.to(device)
     
+    def forward(self, x):
+        # x: [batch_size, seq_len, hidden_size]
+        
+        # Create attention mask
+        attn_mask = self.create_mask(x.size(1), x.device)
+        
+        # First residual connection: skip masked multi-head attention
+        residual1 = x
+        
+        # Self-attention on sequence
+        attn_output, _ = self.self_attn(
+            query=x,
+            key=x,
+            value=x,
+            attn_mask=attn_mask
+        )
+        x = self.norm1(residual1 + self.dropout(attn_output))
+        
+        # Second residual connection: skip feed-forward network
+        residual2 = x
+        
+        # Feed-forward network
+        ff_output = self.feed_forward(x)
+        x = self.norm2(residual2 + self.dropout(ff_output))
+        
+        return x
+
+# Define the decoder with residual connections and linear projection
+class ImageCaptionDecoder(nn.Module):
+    def __init__(self, hidden_size=512, num_heads=8, vocab_size=32000, num_decoder_layers=6, dropout=0.1):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.num_decoder_layers = num_decoder_layers
+        
+        # Positional encoding
+        self.pos_encoder = LearnablePositionalEncoding(hidden_size)
+        
+        # Stack of decoder layers
+        self.decoder_layers = nn.ModuleList([
+            DecoderLayer(hidden_size, num_heads, dropout)
+            for _ in range(num_decoder_layers)
+        ])
+        
+        # Linear projection to vocabulary size
+        self.projection = nn.Linear(hidden_size, vocab_size)
+        
     def forward(self, tgt, memory):
         # tgt: caption input sequence [batch_size, seq_len, hidden_size]
         # memory: context vectors [batch_size, 1, hidden_size]
@@ -81,27 +125,9 @@ class ImageCaptionDecoder(nn.Module):
         # tgt: [batch_size, seq_len, hidden_size]
         combined = torch.cat([memory, tgt], dim=1)  # [batch_size, seq_len+1, hidden_size]
         
-        # Create attention mask for the combined sequence
-        attn_mask = self.create_mask(combined.size(1))
-        
-        # First residual connection: skip masked multi-head attention
-        residual1 = combined
-        
-        # Self-attention on combined sequence
-        attn_output, _ = self.self_attn(
-            query=combined,
-            key=combined,
-            value=combined,
-            attn_mask=attn_mask
-        )
-        combined = self.norm1(residual1 + self.dropout(attn_output))
-        
-        # Second residual connection: skip feed-forward network
-        residual2 = combined
-        
-        # Feed-forward network
-        ff_output = self.feed_forward(combined)
-        combined = self.norm2(residual2 + self.dropout(ff_output))
+        # Pass through each decoder layer
+        for decoder_layer in self.decoder_layers:
+            combined = decoder_layer(combined)
         
         # Project to vocabulary size for caption logits
         # Only project the caption part (excluding the context vector)
@@ -110,7 +136,7 @@ class ImageCaptionDecoder(nn.Module):
         return logits
 
 # Process image patches through CLIP's vision encoder
-def process_image_patches_using_encoder(image_patches):
+def get_context_vectors_from_encoder(image_patches):
     # Process each image in the batch
     context_vectors = []
     
@@ -135,19 +161,117 @@ def process_image_patches_using_encoder(image_patches):
     
     return torch.cat(context_vectors, dim=0)  # Shape: [batch_size, num_patches, hidden_size]
 
+# Initialize wandb
+
+wandb.init(
+        project="multimodal-transfer-learning", 
+        entity="dtian",
+        config={
+            "batch_size": batch_size,
+            "embed_dim": embed_dim,
+            "ff_dim": ff_dim, 
+            "num_layers": num_layers,
+            "epochs": epochs,
+            "learning_rate": lr,
+            "patience": patience
+        })
+
 # Initialize decoder
 decoder = ImageCaptionDecoder().to(device)
 
 # Initialize optimizer
 optimizer = torch.optim.Adam(decoder.parameters(), lr=0.0001)
 
-# Early stopping parameters
-patience = 3
-min_delta = 0.001
-best_val_loss = float('inf')
-counter = 0
+num_epochs = 10
 
-#for each epoch
+# Pre-compute context vectors for all training data
+print("Pre-computing context vectors for training data...")
+train_context_vectors = []
+for batch in tqdm(train_loader, desc="Processing training images"):
+    image_patches = batch['image_patches'].to(device)
+    context_vectors = get_context_vectors_from_encoder(image_patches)
+    train_context_vectors.append(context_vectors)
+
+# Pre-compute context vectors for all validation data
+print("Pre-computing context vectors for validation data...")
+val_context_vectors = []
+for batch in tqdm(val_loader, desc="Processing validation images"):
+    image_patches = batch['image_patches'].to(device)
+    context_vectors = get_context_vectors_from_encoder(image_patches)
+    val_context_vectors.append(context_vectors)
+
+# Pre-compute context vectors for all test data
+print("Pre-computing context vectors for test data...")
+test_context_vectors = []
+for batch in tqdm(test_loader, desc="Processing test images"):
+    image_patches = batch['image_patches'].to(device)
+    context_vectors = get_context_vectors_from_encoder(image_patches)
+    test_context_vectors.append(context_vectors)
+
+# Pre-compute text embeddings for all training data
+print("Pre-computing text embeddings for training data...")
+train_text_embeddings = []
+train_labels = []
+for batch in tqdm(train_loader, desc="Processing training captions"):
+    captions = batch['captions']
+    batch_embeddings = []
+    batch_labels = []
+    for caption_input, caption_label in captions[0]:
+        caption_input = caption_input.to(device)
+        caption_label = caption_label.to(device)
+        text_outputs = model.text_model(
+            input_ids=caption_input.unsqueeze(0),
+            return_dict=True
+        )
+        caption_embeddings = text_outputs.last_hidden_state
+        batch_embeddings.append(caption_embeddings)
+        batch_labels.append(caption_label)
+    train_text_embeddings.append(batch_embeddings)
+    train_labels.append(batch_labels)
+
+# Pre-compute text embeddings for all validation data
+print("Pre-computing text embeddings for validation data...")
+val_text_embeddings = []
+val_labels = []
+for batch in tqdm(val_loader, desc="Processing validation captions"):
+    captions = batch['captions']
+    batch_embeddings = []
+    batch_labels = []
+    for caption_input, caption_label in captions[0]:
+        caption_input = caption_input.to(device)
+        caption_label = caption_label.to(device)
+        text_outputs = model.text_model(
+            input_ids=caption_input.unsqueeze(0),
+            return_dict=True
+        )
+        caption_embeddings = text_outputs.last_hidden_state
+        batch_embeddings.append(caption_embeddings)
+        batch_labels.append(caption_label)
+    val_text_embeddings.append(batch_embeddings)
+    val_labels.append(batch_labels)
+
+# Pre-compute text embeddings for all test data
+print("Pre-computing text embeddings for test data...")
+test_text_embeddings = []
+test_labels = []
+for batch in tqdm(test_loader, desc="Processing test captions"):
+    captions = batch['captions']
+    batch_embeddings = []
+    batch_labels = []
+    for caption_input, caption_label in captions[0]:
+        caption_input = caption_input.to(device)
+        caption_label = caption_label.to(device)
+        text_outputs = model.text_model(
+            input_ids=caption_input.unsqueeze(0),
+            return_dict=True
+        )
+        caption_embeddings = text_outputs.last_hidden_state
+        batch_embeddings.append(caption_embeddings)
+        batch_labels.append(caption_label)
+    test_text_embeddings.append(batch_embeddings)
+    test_labels.append(batch_labels)
+
+# Training loop
 for epoch in range(num_epochs):
     # Initialize loss tracking
     total_train_loss = 0
@@ -157,31 +281,18 @@ for epoch in range(num_epochs):
     decoder.train()
     
     # Training loop
-    for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Training"):
+    for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Training")):
         # Zero the gradients
         optimizer.zero_grad()
         
-        # Get image patches and captions
-        image_patches = batch['image_patches'].to(device)
-        captions = batch['captions']
-        
-        # Process patches through CLIP's vision encoder
-        context_vectors = process_image_patches_using_encoder(image_patches)
+        # Get pre-computed context vectors and text embeddings
+        context_vectors = train_context_vectors[batch_idx]
+        batch_embeddings = train_text_embeddings[batch_idx]
+        batch_labels = train_labels[batch_idx]
         
         # Process each image-caption pair
         batch_loss = 0
-        for i, (caption_input, caption_label) in enumerate(captions[0]):
-            # Move caption to device
-            caption_input = caption_input.to(device)
-            caption_label = caption_label.to(device)
-            
-            # Get text embeddings for caption input
-            text_outputs = model.text_model(
-                input_ids=caption_input.unsqueeze(0),
-                return_dict=True
-            )
-            caption_embeddings = text_outputs.last_hidden_state
-            
+        for i, (caption_embeddings, caption_label) in enumerate(zip(batch_embeddings, batch_labels)):
             # Get context vector for this image
             context_vector = context_vectors[i].unsqueeze(0)
             
@@ -198,7 +309,7 @@ for epoch in range(num_epochs):
             batch_loss += loss.item()
         
         # Average loss over captions in batch
-        batch_loss /= len(captions[0])
+        batch_loss /= len(batch_embeddings)
         total_train_loss += batch_loss
         num_train_batches += 1
         
@@ -217,73 +328,76 @@ for epoch in range(num_epochs):
     # Calculate average training loss
     avg_train_loss = total_train_loss / num_train_batches
     
-    # Validation loop
+    # Evaluate on validation set
     decoder.eval()
-    total_val_loss = 0
-    num_val_batches = 0
+    val_predictions = []
+    val_true_labels = []
     
     with torch.no_grad():
-        for batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Validation"):
-            # Get image patches and captions
-            image_patches = batch['image_patches'].to(device)
-            captions = batch['captions']
+        for batch_idx, batch in enumerate(tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Validation")):
+            context_vectors = val_context_vectors[batch_idx]
+            batch_embeddings = val_text_embeddings[batch_idx]
+            batch_labels = val_labels[batch_idx]
             
-            # Process patches through CLIP's vision encoder
-            context_vectors = process_image_patches_using_encoder(image_patches)
-            
-            # Process each image-caption pair
-            batch_loss = 0
-            for i, (caption_input, caption_label) in enumerate(captions[0]):
-                # Move caption to device
-                caption_input = caption_input.to(device)
-                caption_label = caption_label.to(device)
-                
-                # Get text embeddings for caption input
-                text_outputs = model.text_model(
-                    input_ids=caption_input.unsqueeze(0),
-                    return_dict=True
-                )
-                caption_embeddings = text_outputs.last_hidden_state
-                
-                # Get context vector for this image
+            for i, (caption_embeddings, caption_label) in enumerate(zip(batch_embeddings, batch_labels)):
                 context_vector = context_vectors[i].unsqueeze(0)
-                
-                # Pass through decoder
                 logits = decoder(caption_embeddings, context_vector)
+                predictions = torch.argmax(logits, dim=-1)
                 
-                # Compute cross entropy loss
-                logits = logits.view(-1, logits.size(-1))
-                labels = caption_label.view(-1)
+                # Remove padding tokens (0) for accuracy calculation
+                valid_predictions = predictions[predictions != 0]
+                valid_labels = caption_label[caption_label != 0]
                 
-                criterion = nn.CrossEntropyLoss(ignore_index=0)
-                loss = criterion(logits, labels)
-                
-                batch_loss += loss.item()
+                val_predictions.extend(valid_predictions.cpu().numpy())
+                val_true_labels.extend(valid_labels.cpu().numpy())
+    
+    val_accuracy = accuracy_score(val_true_labels, val_predictions)
+    
+    # Log metrics to wandb
+    wandb.log({
+        "epoch": epoch + 1,
+        "train_loss": avg_train_loss,
+        "val_accuracy": val_accuracy
+    })
+    
+    print(f"Epoch {epoch+1} - Training Loss: {avg_train_loss:.4f}, Validation Accuracy: {val_accuracy:.4f}")
+
+# Save the trained model
+torch.save(decoder.state_dict(), 'best_model.pth')
+
+# Evaluation on test set
+print("\nEvaluating on test set...")
+test_predictions = []
+test_true_labels = []
+
+with torch.no_grad():
+    for batch_idx, batch in enumerate(tqdm(test_loader, desc="Test")):
+        context_vectors = test_context_vectors[batch_idx]
+        batch_embeddings = test_text_embeddings[batch_idx]
+        batch_labels = test_labels[batch_idx]
+        
+        for i, (caption_embeddings, caption_label) in enumerate(zip(batch_embeddings, batch_labels)):
+            context_vector = context_vectors[i].unsqueeze(0)
+            logits = decoder(caption_embeddings, context_vector)
+            predictions = torch.argmax(logits, dim=-1)
             
-            # Average loss over captions in batch
-            batch_loss /= len(captions[0])
-            total_val_loss += batch_loss
-            num_val_batches += 1
-    
-    # Calculate average validation loss
-    avg_val_loss = total_val_loss / num_val_batches
-    
-    # Print epoch losses
-    print(f"Epoch {epoch+1} - Training Loss: {avg_train_loss:.4f}, Validation Loss: {avg_val_loss:.4f}")
-    
-    # Early stopping check
-    if avg_val_loss < best_val_loss - min_delta:
-        best_val_loss = avg_val_loss
-        counter = 0
-        # Save best model
-        torch.save(decoder.state_dict(), 'best_model.pth')
-    else:
-        counter += 1
-        if counter >= patience:
-            print(f"Early stopping triggered after {epoch+1} epochs")
-            break
-    
-    # You can now use logits for caption generation or other tasks
+            # Remove padding tokens (0) for accuracy calculation
+            valid_predictions = predictions[predictions != 0]
+            valid_labels = caption_label[caption_label != 0]
+            
+            test_predictions.extend(valid_predictions.cpu().numpy())
+            test_true_labels.extend(valid_labels.cpu().numpy())
+
+test_accuracy = accuracy_score(test_true_labels, test_predictions)
+print(f"Test Accuracy: {test_accuracy:.4f}")
+
+# Log final test accuracy to wandb
+wandb.log({
+    "test_accuracy": test_accuracy
+})
+
+# Close wandb
+wandb.finish()
 
 
 
