@@ -173,34 +173,26 @@ def compute_patch_embeddings(dataloader, device):
     return patch_embeddings
 
 def compute_text_embeddings(dataloader, device):
-    """Pre-compute text embeddings for all captions in a dataloader.
-    
-    Args:
-        dataloader: DataLoader containing the captions
-        device: Device to run the computation on
-        
-    Returns:
-        Tuple of (list of text embeddings for each batch, list of labels for each batch)
-    """
     text_embeddings = []
     labels = []
+
     for batch in tqdm(dataloader, desc="Processing captions"):
-        captions = batch['captions']
-        batch_embeddings = []
-        batch_labels = []
-        for caption_input, caption_label in captions[0]:
-            caption_input = caption_input.to(device)
-            caption_label = caption_label.to(device)
+        caption_input, caption_label = batch['captions']  # Unpack the full batch
+        caption_input = caption_input.to(device)          # Shape: [B, seq_len]
+        caption_label = caption_label.to(device)
+
+        with torch.no_grad():
             text_outputs = model.text_model(
-                input_ids=caption_input.unsqueeze(0),
+                input_ids=caption_input,
                 return_dict=True
             )
-            caption_embeddings = text_outputs.last_hidden_state
-            batch_embeddings.append(caption_embeddings)
-            batch_labels.append(caption_label)
-        text_embeddings.append(batch_embeddings)
-        labels.append(batch_labels)
+            caption_embeddings = text_outputs.last_hidden_state  # [B, seq_len, hidden]
+
+        text_embeddings.append(caption_embeddings)
+        labels.append(caption_label)
+
     return text_embeddings, labels
+
 
 def precompute_decoder_inputs(patch_embeddings_list, text_embeddings_list):
     combined_inputs = []
@@ -213,14 +205,14 @@ def precompute_decoder_inputs(patch_embeddings_list, text_embeddings_list):
     return combined_inputs
 
 # Pre-compute context vectors for all datasets
-print("Pre-computing context vectors for training data...")
-train_patch_embeddings = compute_patch_embeddings(train_loader, device)
+#print("Pre-computing context vectors for training data...")
+#train_patch_embeddings = compute_patch_embeddings(train_loader, device)
 
-print("Pre-computing context vectors for validation data...")
-val_patch_embeddings = compute_patch_embeddings(val_loader, device)
+#print("Pre-computing context vectors for validation data...")
+#val_patch_embeddings = compute_patch_embeddings(val_loader, device)
 
-print("Pre-computing context vectors for test data...")
-test_patch_embeddings = compute_patch_embeddings(test_loader, device)
+#print("Pre-computing context vectors for test data...")
+#test_patch_embeddings = compute_patch_embeddings(test_loader, device)
 
 # Pre-compute text embeddings for all datasets
 print("Pre-computing text embeddings for training data...")
