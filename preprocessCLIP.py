@@ -19,13 +19,13 @@ def load_flickr30k():
     dataset = load_dataset("nlphuji/flickr30k")
     
     # Print dataset structure
-    print("\nDataset structure:")
-    print(f"Available splits: {list(dataset.keys())}")
-    for split in dataset.keys():
-        print(f"\n{split} split:")
-        print(f"Number of examples: {len(dataset[split])}")
-        print(f"Features: {dataset[split].features}")
-        print(f"First example keys: {list(dataset[split][0].keys())}")
+    #print("\nDataset structure:")
+    #print(f"Available splits: {list(dataset.keys())}")
+    #for split in dataset.keys():
+    #    print(f"\n{split} split:")
+    #    print(f"Number of examples: {len(dataset[split])}")
+    #    print(f"Features: {dataset[split].features}")
+    #    print(f"First example keys: {list(dataset[split][0].keys())}")
     
     return dataset
 

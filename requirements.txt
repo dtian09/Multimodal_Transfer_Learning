@@ -5,3 +5,5 @@ Pillow>=8.0.0
 sentencepiece>=0.1.99
 requests>=2.25.1
 tqdm>=4.65.0 
+scikit-learn
+wandb
