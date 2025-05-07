@@ -28,7 +28,7 @@ wandb.init(
         project="multimodal-transfer-learning", 
         entity="dtian",
         config={
-            "batch_size": 64,
+            "batch_size": 32,
             "hidden_size": 512,
             "num_heads": 8,
             "vocab_size": clip_model.config.text_config.vocab_size,
@@ -57,19 +57,34 @@ train_dataset = full_data.filter(lambda x: x['split'] == 'train')
 val_dataset = full_data.filter(lambda x: x['split'] == 'val')
 test_dataset = full_data.filter(lambda x: x['split'] == 'test')
 
-def expand_flickr30k_split(split_dataset):
-    expanded_data = []
-    for example in split_dataset:
-        for caption in example["caption"]:
-            expanded_data.append({
-                "image": example["image"],
-                "caption": caption
-            })
-    return Dataset.from_list(expanded_data)
+# def expand_flickr30k_split(split_dataset):
+#     expanded_data = []
+#     for example in split_dataset:
+#         for caption in example["caption"]:
+#             expanded_data.append({
+#                 "image": example["image"],
+#                 "caption": caption
+#             })
+#     return Dataset.from_list(expanded_data)
 
-train_dataset = expand_flickr30k_split(train_dataset)
-val_dataset = expand_flickr30k_split(val_dataset)
-test_dataset = expand_flickr30k_split(test_dataset)
+# train_dataset = expand_flickr30k_split(train_dataset)
+# val_dataset = expand_flickr30k_split(val_dataset)
+# test_dataset = expand_flickr30k_split(test_dataset)
+
+def select_one_caption_per_image(split_dataset):
+    selected_data = []
+    for example in split_dataset:
+        # Just pick the first caption
+        caption = example["caption"][0]
+        selected_data.append({
+            "image": example["image"],
+            "caption": caption
+        })
+    return Dataset.from_list(selected_data)
+
+train_dataset = select_one_caption_per_image(train_dataset)
+val_dataset = select_one_caption_per_image(val_dataset)
+test_dataset = select_one_caption_per_image(test_dataset)
 
 # Image transform (must match CLIP's expected input)
 clip_image_transform = transforms.Compose([
@@ -175,8 +190,8 @@ for epoch in range(num_epochs):
 
         # Prepend <sos> token to input_ids
         sos_tokens = torch.full((input_ids.size(0), 1), sos_id, dtype=torch.long).to(device)
-        input_ids = torch.cat([sos_tokens, input_ids], dim=1).cuda()
-        padding_mask = torch.cat([torch.ones_like(sos_tokens), padding_mask], dim=1).cuda()
+        input_ids = torch.cat([sos_tokens, input_ids], dim=1).to(device)
+        padding_mask = torch.cat([torch.ones_like(sos_tokens), padding_mask], dim=1).to(device)
         targets = input_ids[:, 1:]  # Shifted for teacher forcing
 
         # Get token embeddings from CLIP text model embedding layer
@@ -184,7 +199,7 @@ for epoch in range(num_epochs):
             text_embeddings = clip_model.text_model.embeddings(input_ids=input_ids)  # [B, T+1, D]
 
         # Concatenate image + text embeddings
-        combined_embeddings = torch.cat([image_patch_embeddings, text_embeddings], dim=1)  # [B, N+1 + T+1, D]
+        combined_embeddings = torch.cat([image_patch_embeddings, text_embeddings], dim=1).to(device)  # [B, N+1 + T+1, D]
 
         # Pass combined embeddings to decoder (along with image patch length)
         logits = decoder(combined_embeddings, image_patch_len=image_patch_embeddings.size(1), padding_mask=padding_mask)  # [B, T+1, V]
@@ -218,7 +233,7 @@ for epoch in range(num_epochs):
                 add_special_tokens=False
             )
             input_ids = encoded["input_ids"]
-            sos_tokens = torch.full((input_ids.size(0), 1), clip_tokenizer.bos_token_id, dtype=torch.long)
+            sos_tokens = torch.full((input_ids.size(0), 1), clip_tokenizer.bos_token_id, dtype=torch.long).to(device)
             input_ids = torch.cat([sos_tokens, input_ids], dim=1).to(device)
             targets = input_ids[:, 1:]
             
@@ -229,7 +244,7 @@ for epoch in range(num_epochs):
             combined = torch.cat([image_patches, token_embeddings], dim=1)
 
             padding_mask = encoded["attention_mask"]
-            padding_mask = torch.cat([torch.ones_like(sos_tokens), padding_mask], dim=1).cuda()
+            padding_mask = torch.cat([torch.ones_like(sos_tokens), padding_mask], dim=1).to(device)
             
             logits = decoder(combined, 
                              image_patch_len=image_patches.size(1),
@@ -272,7 +287,7 @@ with torch.no_grad():
             add_special_tokens=False
         )
         input_ids = encoded["input_ids"]
-        sos_tokens = torch.full((input_ids.size(0), 1), clip_tokenizer.bos_token_id, dtype=torch.long)
+        sos_tokens = torch.full((input_ids.size(0), 1), clip_tokenizer.bos_token_id, dtype=torch.long).to(device)
         input_ids = torch.cat([sos_tokens, input_ids], dim=1).to(device)
         targets = input_ids[:, 1:]
 
@@ -282,7 +297,7 @@ with torch.no_grad():
         combined = torch.cat([image_patches, token_embeddings], dim=1)
 
         padding_mask = encoded["attention_mask"]
-        padding_mask = torch.cat([torch.ones_like(sos_tokens), padding_mask], dim=1).cuda()
+        padding_mask = torch.cat([torch.ones_like(sos_tokens), padding_mask], dim=1).to(device)
             
         logits = decoder(combined, image_patch_len=image_patches.size(1), padding_mask=padding_mask)
         acc = compute_accuracy(logits, targets, pad_id=clip_tokenizer.pad_token_id)
