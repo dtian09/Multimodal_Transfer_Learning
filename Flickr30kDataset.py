@@ -54,5 +54,5 @@ class Flickr30kDataset(Dataset):
             "image": image,
             "input_ids": encoding["input_ids"].squeeze(0),
             "attention_mask": encoding["attention_mask"].squeeze(0),
-            "caption": caption  # now guaranteed to be a plain Python string
+            "caption": caption  
         }

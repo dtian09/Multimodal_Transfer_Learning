@@ -15,24 +15,24 @@ class LearnablePositionalEncoding(nn.Module):
 
 # Define a single decoder layer
 class DecoderLayer(nn.Module):
-    def __init__(self, hidden_size=512, num_heads=8, dropout=0.1):
+    def __init__(self, embedding_dim=512, num_heads=8, dropout=0.1):
         super().__init__()
-        self.hidden_size = hidden_size
+        self.embedding_dim = embedding_dim
         self.num_heads = num_heads
         
         # Multi-head self-attention
-        self.self_attn = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
+        self.self_attn = nn.MultiheadAttention(embedding_dim, num_heads, batch_first=True)
         
         # Feed-forward network
         self.feed_forward = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size * 4),
+            nn.Linear(embedding_dim, embedding_dim * 4),
             nn.ReLU(),
-            nn.Linear(hidden_size * 4, hidden_size)
+            nn.Linear(embedding_dim * 4, embedding_dim)
         )
         
         # Layer normalization
-        self.norm1 = nn.LayerNorm(hidden_size)
-        self.norm2 = nn.LayerNorm(hidden_size)
+        self.norm1 = nn.LayerNorm(embedding_dim)
+        self.norm2 = nn.LayerNorm(embedding_dim)
         
         # Dropout
         self.dropout = nn.Dropout(dropout)
@@ -67,23 +67,23 @@ class DecoderLayer(nn.Module):
 # Define the decoder with residual connections and linear projection
 
 class ImageCaptionDecoder(nn.Module):
-    def __init__(self, hidden_size=512, num_heads=8, vocab_size=32000, num_decoder_layers=6, dropout=0.1):
+    def __init__(self, embedding_dim=512, num_heads=8, vocab_size=32000, num_decoder_layers=6, dropout=0.1):
         super().__init__()
-        self.hidden_size = hidden_size
+        self.embedding_dim = embedding_dim
         self.num_heads = num_heads
         self.num_decoder_layers = num_decoder_layers
         
         # Positional encoding
-        self.pos_encoder = LearnablePositionalEncoding(hidden_size)
+        self.pos_encoder = LearnablePositionalEncoding(embedding_dim)
         
         # Stack of decoder layers
         self.decoder_layers = nn.ModuleList([
-            DecoderLayer(hidden_size, num_heads, dropout)
+            DecoderLayer(embedding_dim, num_heads, dropout)
             for _ in range(num_decoder_layers)
         ])
         
         # Linear projection to vocabulary size
-        self.projection = nn.Linear(hidden_size, vocab_size)
+        self.projection = nn.Linear(embedding_dim, vocab_size)
         
     def forward(self, combined_embeddings, image_patch_len, padding_mask=None):
         x = self.pos_encoder(combined_embeddings)

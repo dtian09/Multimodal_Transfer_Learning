@@ -36,7 +36,7 @@ wandb.init(
         entity="dtian",
         config={
             "batch_size": 32,
-            "hidden_size": 512,
+            "embedding_dim": 512, #embedding dimensionality of decoder (the pretrained CLIP Model has output embedding dimensionality 512)
             "num_heads": 8,
             "vocab_size": clip_model.config.text_config.vocab_size,
             "num_decoder_layers": 6,
@@ -48,7 +48,7 @@ wandb.init(
 
 # Get parameters from wandb config
 batch_size = wandb.config.batch_size
-hidden_size = wandb.config.hidden_size
+embedding_dim = wandb.config.embedding_dim
 num_heads = wandb.config.num_heads
 vocab_size = wandb.config.vocab_size
 num_decoder_layers = wandb.config.num_decoder_layers
@@ -63,7 +63,7 @@ trainloader = DataLoader(trainset, batch_size=32, shuffle=True)
 
 # Decoder
 decoder = ImageCaptionDecoder(
-    hidden_size=hidden_size,
+    embedding_dim=embedding_dim,
     num_heads=num_heads,
     vocab_size=vocab_size,
     num_decoder_layers=num_decoder_layers,
@@ -86,16 +86,21 @@ early_stop_counter = 0
 valset = Flickr30kDataset(split="val", max_length=31)
 valloader = DataLoader(valset, batch_size=32, shuffle=True)
 
+projection = nn.Linear(768, embedding_dim).to(device)#project output image embedding dimensionality of CLIP model to embedding dimensionality of decoder
+#the pretrained CLIP model has output embedding dimensionality 512.
+
 for epoch in range(num_epochs):
     decoder.train()
     total_loss = 0
     batch_num = 0
+    image_patch_len = -1
     for batch in tqdm(trainloader, desc=f"Epoch {epoch+1} Training"):
         # Cache combined input if needed
         combined_path = f"combined_inputs_batch_{batch_num}.pt"
 
         if os.path.exists(combined_path):
             combined_input = torch.load(combined_path)
+            input_ids = batch["input_ids"].to(device)
         else:
             images = batch["image"].to(device)
             input_ids = batch["input_ids"].to(device)
@@ -103,7 +108,9 @@ for epoch in range(num_epochs):
 
             # Encode images
             with torch.no_grad():
-                image_features = clip_model.vision_model(pixel_values=images).last_hidden_state  # [B, P, D]
+                image_features = clip_model.vision_model(pixel_values=images).last_hidden_state
+                image_features = projection(image_features)
+
             image_patch_len = image_features.size(1)
 
             # Encode text (get token embeddings only)
@@ -150,18 +157,21 @@ for epoch in range(num_epochs):
     val_preds, val_labels = [], []
     with torch.no_grad():
         batch_num = 0
+        image_patch_len = -1
         for batch in valloader:
             # Cache combined input if needed
             combined_val_path = f"combined_val_inputs_batch_{batch_num}.pt"
 
             if os.path.exists(combined_val_path):
                 combined_val_input = torch.load(combined_val_path)
+                input_ids = batch["input_ids"].to(device)
             else:
                 images = batch["image"].to(device)
                 input_ids = batch["input_ids"].to(device)
                 captions = batch["caption"]
 
                 image_features = clip_model.vision_model(pixel_values=images).last_hidden_state
+                image_features = projection(image_features)
                 image_patch_len = image_features.size(1)
 
                 text_inputs = clip_tokenizer(captions, padding="max_length", truncation=True,
@@ -171,7 +181,7 @@ for epoch in range(num_epochs):
                 sos_embedding = clip_model.text_model.embeddings.token_embedding(
                     torch.tensor([sos_token_id], device=device)
                 ).expand(images.size(0), 1, -1)
-
+           
                 combined_input = torch.cat([image_features, sos_embedding, text_embeddings[:, :-1, :]], dim=1)
                 torch.save(combined_input, combined_val_path)
             
@@ -223,6 +233,7 @@ with torch.no_grad():
         captions = batch["caption"]
 
         image_features = clip_model.vision_model(pixel_values=images).last_hidden_state
+        image_features = projection(image_features)
         image_patch_len = image_features.size(1)
 
         text_inputs = clip_tokenizer(captions, padding="max_length", truncation=True,
